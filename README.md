@@ -47,12 +47,140 @@ $ oc get projects --no-headers | wc -l
 ```
 Its worth noting that we're pivoting on a specific version of the NFD operator.  If we ran this command while a new version was being deployed, the count of the first command may not match the number of projects as the new version rolls out.  Likewise, if we only used `grep 'nfd'` in our command, then we'll have a count higher than the number of projects since the old version will stick around until the new version is successfully deployed.
 
+Now that we know how to find all of the Operators that comprise our OpenShift cluster and all of the Operators that have been installed separately from the cluster operators, let's start untangling the pieces and demonstrate how they fit together.
+
 ## Untangling the Operator
-* From finding the operators to mapping all of their components/resources
-* What version of the operator am I running?
-* What images does the operator use?
-* What objects does the operator manage?
-* What is managing the operator?
+Since `ClusterOperator`s will (for the most part) always be the same, we're going to use them as a starting point and then compare/contrast against a non-`ClusterOperator`.
+
+We'll use the authentication `ClusterOperator` for this section and to start, let's get a baseline of the Operator's stats.
+```
+$ oc get co/authentication
+NAME             VERSION   AVAILABLE   PROGRESSING   DEGRADED   SINCE
+authentication   4.5.3     True        False         False      3d2h
+```
+The output is pretty self explanatory so we'll dive into the details a bit more. First, we'll grab the YAML for the Operator and look at the `managedFields` section.
+```
+$ oc get co/authentication -o yaml
+...
+  managedFields:
+  - apiVersion: config.openshift.io/v1
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:metadata:
+        f:annotations:
+          .: {}
+          f:exclude.release.openshift.io/internal-openshift-hosted: {}
+      f:spec: {}
+      f:status:
+        .: {}
+        f:extension: {}
+    manager: cluster-version-operator
+    operation: Update
+    time: "2020-08-28T16:56:59Z"
+  - apiVersion: config.openshift.io/v1
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:status:
+        f:conditions: {}
+        f:relatedObjects: {}
+        f:versions: {}
+    manager: authentication-operator
+    operation: Update
+    time: "2020-08-28T22:19:27Z"
+```
+This looks a lot more complicated than it is.  Luckily, we can use OpenShift's built-in documentation to figure out what they mean! A snippet is below this explains what we're looking at.
+```
+$ oc explain clusteroperator.metadata.managedFields
+KIND:     ClusterOperator
+VERSION:  config.openshift.io/v1
+
+RESOURCE: managedFields <[]Object>
+
+DESCRIPTION:
+     ManagedFields maps workflow-id and version to the set of fields that are managed by that workflow. This is mostly for internal housekeeping, and users typically shouldn't need to set or understand this field. A workflow can be the user's name, a controller's name, or the name of a specific apply path like "ci-cd". The set of fields is always in the version that the workflow used when modifying the object.
+
+FIELDS:
+   fieldsV1     <map[string]>
+     FieldsV1 holds the first JSON version format as described in the "FieldsV1" type.
+
+   manager      <string>
+     Manager is an identifier of the workflow managing these fields.
+```
+To put it simply, `fieldsV1` holds the format, and `manager` holds the object that manages the format.  In the case of the authentication operator, that means that the fields listed in `managedFields[0]` are managed by the `cluster-version-operator` and the fields in `managedFields[1]` are managed by the `authentication-operator`.
+
+Let's continue with our YAML analysis with the `relatedObjects` section. What you see here is a list of resources which may or may not be custom resources, along with the API group they belong to, and their name.  All of the items on this list are instantiated objects on the cluster so we can query any of them like a normal resource.
+```
+  relatedObjects:
+  - group: operator.openshift.io
+    name: cluster
+    resource: authentications
+  - group: config.openshift.io
+    name: cluster
+    resource: authentications
+  - group: config.openshift.io
+    name: cluster
+    resource: infrastructures
+  - group: config.openshift.io
+    name: cluster
+    resource: oauths
+  - group: route.openshift.io
+    name: oauth-openshift
+    namespace: openshift-authentication
+    resource: routes
+  - group: ""
+    name: oauth-openshift
+    namespace: openshift-authentication
+    resource: services
+  - group: ""
+    name: openshift-config
+    resource: namespaces
+  - group: ""
+    name: openshift-config-managed
+    resource: namespaces
+  - group: ""
+    name: openshift-authentication
+    resource: namespaces
+  - group: ""
+    name: openshift-authentication-operator
+    resource: namespaces
+  - group: ""
+    name: openshift-ingress
+    resource: namespaces
+```
+For an example, let's confirm that the authentication operator pod is running, and that there are two authentication instances running (as noted in `relatedObjects[0]` and `relatedObjects[1]`).
+```
+$ oc get po -n openshift-authentication-operator
+NAME                                      READY   STATUS    RESTARTS   AGE
+authentication-operator-6d74f68f8-6qz92   1/1     Running   1          3d2h
+
+$ oc get authentications
+NAME      AGE
+cluster   3d3h
+```
+That's interesting...there's only one `authentications` custom resource.  Why are there two listed in the `relatedObjects` array for our authentication Operator? If you're readying closely, you may have caught that each instance of `authentications` is in a different API group so when we run the above command, we're only getting it from one API group, not both. If we run the above command and include the group, we'll be able to see two disctint resources.
+```
+$ oc get authentications.operator.openshift.io -o name
+authentication.operator.openshift.io/cluster
+
+$ oc get authentications.config.openshift.io -o name
+authentication.config.openshift.io/cluster
+```
+One last note on this topic; you'll want to pay special attention to entries in `relatedObjects` that have a `namespace` field as that will help direct you to where that resource lives in the event that you need to do some troubleshooting.  For example, if I'm having trouble with authentication, I know that the authentication Operator has a route in the `openshift-authentication` namespace which fronts a service for two pods.
+```
+$ oc get route,service,pod -n openshift-authentication -o name
+route.route.openshift.io/oauth-openshift
+service/oauth-openshift
+pod/oauth-openshift-6d59b47f7-c4lsj
+pod/oauth-openshift-6d59b47f7-pt82j
+```
+Before we move on to a non-`ClusterOperator`, let's take a moment to recap what we've covered so far. We have...
+* Picked a `ClusterOperator` to interrogate.
+* Run a command to get basic Operator info like it's version and state.
+* Learned how to identify pieces of a `ClusterOperator` and what objects manage each piece.
+* Learned how to find objects related to an Operator.
+* Learned that multiple resources of the same type and name can exist under different API groups.
+
+Next, we'll follow an abridged version of the above process to get the details for a non-`ClusterOperator` on the cluster.
 
 ## Leveraging Go templates for a hollistic view
 * Template for single operator view
